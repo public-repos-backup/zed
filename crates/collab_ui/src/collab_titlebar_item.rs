@@ -224,7 +224,7 @@ impl Render for CollabTitlebarItem {
                             el.child(
                                 div()
                                     .child(
-                                        IconButton::new("leave-call", ui::IconName::AudioOff)
+                                        IconButton::new("leave-call", ui::IconName::Exit)
                                             .style(ButtonStyle::Subtle)
                                             .tooltip(|cx| Tooltip::text("Leave call", cx))
                                             .icon_size(IconSize::Small)
@@ -238,7 +238,7 @@ impl Render for CollabTitlebarItem {
                                                 })
                                             }),
                                     )
-                                    .pr_2(),
+                                    .pl_2(),
                             )
                         })
                         .when(!read_only && is_audio_enabled, |this| {

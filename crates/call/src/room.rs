@@ -324,7 +324,7 @@ impl Room {
     }
 
     pub fn mute_on_join(cx: &AppContext) -> bool {
-        CallSettings::get_global(cx).mute_on_join || client::IMPERSONATE_LOGIN.is_some()
+        CallSettings::get_global(cx).mute_on_join
     }
 
     fn from_join_response(
@@ -1424,6 +1424,9 @@ impl Room {
         }
 
         let (displays, publish_id) = if let Some(live_kit) = self.live_kit.as_mut() {
+            if !live_kit.audio_enabled {
+                return Task::ready(Err(anyhow!("not in audio call")));
+            }
             let publish_id = post_inc(&mut live_kit.next_publish_id);
             live_kit.screen_track = LocalTrack::Pending { publish_id };
             cx.notify();
@@ -1498,55 +1501,42 @@ impl Room {
     }
 
     pub fn toggle_mute(&mut self, cx: &mut ModelContext<Self>) {
-        if let Some(live_kit) = self.live_kit.as_mut() {
-            // When unmuting, undeafen if the user was deafened before.
-            if live_kit.muted_by_user
-                || !live_kit.audio_enabled
-                || matches!(live_kit.microphone_track, LocalTrack::None)
-            {
-                live_kit.muted_by_user = false;
-                live_kit.audio_enabled = true;
-            } else {
-                live_kit.muted_by_user = true;
-            }
-            let muted = live_kit.muted_by_user;
+        let Some(live_kit) = self.live_kit.as_mut() else {
+            return;
+        };
 
-            if let Some(task) = self.set_mute(muted, cx) {
+        if !live_kit.audio_enabled {
+            return;
+        }
+
+        let muted = !live_kit.muted_by_user;
+        if let Some(task) = self.set_mute(muted, cx) {
+            task.detach_and_log_err(cx);
+        }
+    }
+
+    pub fn enable_audio(&mut self, cx: &mut ModelContext<Self>) {
+        if let Some(task) = self.update_livekit(true, cx) {
+            task.detach_and_log_err(cx);
+        }
+
+        if dbg!(!Self::mute_on_join(cx)) {
+            if let Some(task) = self.set_mute(false, cx) {
                 task.detach_and_log_err(cx);
             }
         }
     }
 
     pub fn disable_audio(&mut self, cx: &mut ModelContext<Self>) {
-        if let Some(task) = self.set_deafened(true, cx) {
+        if let Some(task) = self.update_livekit(false, cx) {
             task.detach_and_log_err(cx);
         }
 
         if let Some(task) = self.set_mute(true, cx) {
             task.detach_and_log_err(cx);
         }
-    }
 
-    // enable_audio / disable_audio
-    pub fn toggle_deafen(&mut self, cx: &mut ModelContext<Self>) {
-        if let Some(live_kit) = self.live_kit.as_mut() {
-            // When deafening, mute the microphone if it was not already muted.
-            // When un-deafening, unmute the microphone, unless it was explicitly muted.
-            let deafened = !live_kit.audio_enabled;
-            live_kit.audio_enabled = deafened;
-            let should_change_mute = !live_kit.muted_by_user;
-
-            if let Some(task) = self.set_deafened(deafened, cx) {
-                task.detach_and_log_err(cx);
-            }
-
-            // this is now the setting "mute_on_join"
-            if should_change_mute {
-                if let Some(task) = self.set_mute(deafened, cx) {
-                    task.detach_and_log_err(cx);
-                }
-            }
-        }
+        self.unshare_screen(cx).log_err();
     }
 
     pub fn unshare_screen(&mut self, cx: &mut ModelContext<Self>) -> Result<()> {
@@ -1576,12 +1566,13 @@ impl Room {
         }
     }
 
-    fn set_deafened(
+    fn update_livekit(
         &mut self,
-        deafened: bool,
+        audio_enabled: bool,
         cx: &mut ModelContext<Self>,
     ) -> Option<Task<Result<()>>> {
         let live_kit = self.live_kit.as_mut()?;
+        live_kit.audio_enabled = audio_enabled;
         cx.notify();
 
         let mut track_updates = Vec::new();
@@ -1590,14 +1581,14 @@ impl Room {
                 .room
                 .remote_audio_track_publications(&participant.user.id.to_string())
             {
-                track_updates.push(publication.set_enabled(!deafened));
+                track_updates.push(publication.set_enabled(audio_enabled));
             }
 
             for track in participant.audio_tracks.values() {
-                if deafened {
-                    track.stop();
-                } else {
+                if audio_enabled {
                     track.start();
+                } else {
+                    track.stop();
                 }
             }
         }
@@ -1616,6 +1607,7 @@ impl Room {
         cx: &mut ModelContext<Room>,
     ) -> Option<Task<Result<()>>> {
         let live_kit = self.live_kit.as_mut()?;
+        live_kit.muted_by_user = should_mute;
         cx.notify();
 
         if should_mute {
