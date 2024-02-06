@@ -955,19 +955,39 @@ impl CollabPanel {
         is_selected: bool,
         cx: &mut ViewContext<Self>,
     ) -> impl IntoElement {
+        let is_in_call = ActiveCall::global(cx)
+            .read(cx)
+            .room()
+            .is_some_and(|room| room.read(cx).is_connected_to_livekit());
         ListItem::new("channel-call")
             .selected(is_selected)
-            .on_click(cx.listener(move |this, _, cx| {
-                this.join_channel_call(channel_id, cx);
-            }))
             .start_slot(
                 h_flex()
                     .gap_1()
                     .child(render_tree_branch(false, true, cx))
                     .child(IconButton::new(0, IconName::AudioOn)),
             )
-            .child(Label::new("call"))
-            .tooltip(move |cx| Tooltip::text("Join audio call", cx))
+            .when(is_in_call, |el| {
+                el.end_slot(
+                    IconButton::new(1, IconName::Exit)
+                        .style(ButtonStyle::Filled)
+                        .shape(ui::IconButtonShape::Square)
+                        .tooltip(|cx| Tooltip::text("Leave call", cx))
+                        .on_click(cx.listener(|this, _, cx| this.leave_channel_call(cx))),
+                )
+            })
+            .when(!is_in_call, |el| {
+                el.tooltip(move |cx| Tooltip::text("Join audio call", cx))
+                    .on_click(cx.listener(move |this, _, cx| {
+                        this.join_channel_call(channel_id, cx);
+                    }))
+            })
+            .child(
+                div()
+                    .text_ui()
+                    .when(is_in_call, |el| el.font_weight(FontWeight::SEMIBOLD))
+                    .child("call"),
+            )
     }
 
     fn render_channel_notes(
@@ -1943,7 +1963,15 @@ impl CollabPanel {
             return;
         };
 
-        room.update(cx, |room, cx| room.enable_audio(cx));
+        room.update(cx, |room, cx| room.connect_to_livekit(cx));
+    }
+
+    fn leave_channel_call(&mut self, cx: &mut ViewContext<Self>) {
+        let Some(room) = ActiveCall::global(cx).read(cx).room().cloned() else {
+            return;
+        };
+
+        room.update(cx, |room, cx| room.disconnect_from_livekit(cx));
     }
 
     fn join_channel_chat(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
