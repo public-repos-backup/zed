@@ -303,16 +303,13 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
 
     decl.register()
 }
-
-///Used to track what the IME does when we send it a keystroke.
-///This is only used to handle the case where the IME mysteriously
-///swallows certain keys.
-///
-///Basically a direct copy of the approach that WezTerm uses in:
-///github.com/wez/wezterm : d5755f3e : window/src/os/macos/window.rs
-enum ImeState {
-    Continue,
-    Acted,
+enum ImeInput {
+    None,
+    Inserted,
+    Pending {
+        text: String,
+        range: Option<Range<usize>>,
+    },
 }
 
 struct MacWindowState {
@@ -339,10 +336,8 @@ struct MacWindowState {
     traffic_light_position: Option<Point<Pixels>>,
     previous_modifiers_changed_event: Option<PlatformInput>,
     // State tracking what the IME did after the last request
-    ime_state: ImeState,
-    ime_replacement_range: Option<Range<usize>>,
-    // Retains the last IME Text
-    ime_text: Option<String>,
+    ime_input: Option<ImeInput>,
+    last_replace_text_in_range: Option<String>,
     external_files_dragged: bool,
 }
 
@@ -552,9 +547,8 @@ impl MacWindow {
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
                 previous_modifiers_changed_event: None,
-                ime_state: ImeState::Continue,
-                ime_replacement_range: None,
-                ime_text: None,
+                ime_input: None,
+                last_replace_text_in_range: None,
                 external_files_dragged: false,
             })));
 
@@ -1111,6 +1105,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     let event = unsafe { PlatformInput::from_native(native_event, Some(window_height)) };
 
     if let Some(PlatformInput::KeyDown(event)) = event {
+        println!("\n\n\n");
         // For certain keystrokes, macOS will first dispatch a "key equivalent" event.
         // If that event isn't handled, it will then dispatch a "key down" event. GPUI
         // makes no distinction between these two types of events, so we need to ignore
@@ -1132,28 +1127,32 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
         } else {
             lock.last_fresh_keydown = Some(keydown.clone());
         }
+
+        lock.ime_input = Some(ImeInput::None);
         drop(lock);
 
         // Send the event to the input context for IME handling, unless the `fn` modifier is
         // being pressed.
         if !fn_modifier {
+            println!("-----> handleEvent");
+
             unsafe {
                 let input_context: id = msg_send![this, inputContext];
                 let _: BOOL = msg_send![input_context, handleEvent: native_event];
             }
+            println!("<----- handleEvent");
         }
 
         let mut handled = false;
         let mut lock = window_state.lock();
-        let ime_text = lock.ime_text.take();
-        let ime_replacement_range = lock.ime_replacement_range.take();
-        match lock.ime_state {
-            ImeState::Acted => handled = true,
-            ImeState::Continue => {
-                if let Some(ime_text) = ime_text.as_ref() {
-                    keydown.key = ime_text.clone();
-                }
-                let is_held = event.is_held;
+        let last_replace_text_in_range = lock.last_replace_text_in_range.take();
+        let ime_input = lock.ime_input.take().unwrap();
+        match ime_input {
+            ImeInput::Inserted => {
+                handled = true;
+            }
+            ImeInput::Pending { text, range } => {
+                keydown.key = text.clone();
                 if let Some(mut callback) = lock.event_callback.take() {
                     drop(lock);
 
@@ -1165,24 +1164,44 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                         handled = callback(PlatformInput::KeyDown(event));
                     }
 
+                    println!("is_composing: {is_composing}, handled: {handled}");
                     if !handled {
-                        if let Some(ime_text) = ime_text.as_ref() {
-                            handled = true;
-                            with_input_handler(this, |input_handler| {
-                                input_handler.replace_text_in_range(ime_replacement_range, ime_text)
-                            });
-                        } else if !is_composing && is_held {
-                            if let Some(last_insert_text) = ime_text {
-                                //MacOS IME is a bit funky, and even when you've told it there's nothing to
-                                //inter it will still swallow certain keys (e.g. 'f', 'j') and not others
-                                //(e.g. 'n'). This is a problem for certain kinds of views, like the terminal
+                        handled = true;
+                        with_input_handler(this, |input_handler| {
+                            input_handler.replace_text_in_range(range, &text)
+                        });
+                        window_state.lock().last_replace_text_in_range = Some(text.clone());
+                    }
+
+                    window_state.lock().event_callback = Some(callback);
+                }
+            }
+            ImeInput::None => {
+                println!("NONE!!!!!!!!!!!!!!!");
+                let is_held = event.is_held;
+                if let Some(mut callback) = lock.event_callback.take() {
+                    drop(lock);
+
+                    let is_composing =
+                        with_input_handler(this, |input_handler| input_handler.marked_text_range())
+                            .flatten()
+                            .is_some();
+                    if !is_composing {
+                        handled = callback(PlatformInput::KeyDown(event));
+                        if !handled && is_held {
+                            if let Some(text) = last_replace_text_in_range {
+                                // MacOS IME is a bit funky, and even when you've told it there's nothing to
+                                // enter it will still swallow certain keys (e.g. 'f', 'j') and not others
+                                // (e.g. 'n'). This is a problem for certain kinds of views, like the terminal.
                                 with_input_handler(this, |input_handler| {
                                     if input_handler.selected_text_range().is_none() {
                                         handled = true;
-                                        input_handler.replace_text_in_range(None, &last_insert_text)
+                                        input_handler.replace_text_in_range(None, &text)
                                     }
                                 });
+                                window_state.lock().last_replace_text_in_range = Some(text);
                             }
+                            println!("!handled && is_held");
                         }
                     }
 
@@ -1608,22 +1627,40 @@ extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NS
         let replacement_range = replacement_range.to_range();
 
         let window_state = get_window_state(this);
-        window_state.lock().ime_text = Some(text.to_string());
+        let is_handling_keydown = window_state.lock().ime_input.is_some();
 
         let is_composing =
             with_input_handler(this, |input_handler| input_handler.marked_text_range())
                 .flatten()
                 .is_some();
 
-        if is_composing || text.chars().count() > 1 {
+        // if let Some(ime_input) = window_state.lock().ime_input.as_mut() {
+        //     *ime_input = ImeInput::Pending {
+        //         text: text.to_string(),
+        //         range: replacement_range,
+        //     };
+        // } else {
+        //     with_input_handler(this, |input_handler| {
+        //         input_handler.replace_text_in_range(replacement_range, text)
+        //     });
+        // }
+
+        let chars_count = text.chars().count();
+        println!("is_composing: {is_composing}, chars_count: {chars_count}, is_handling_keydown: {is_handling_keydown}");
+        if is_composing || text.chars().count() > 1 || !is_handling_keydown {
+            println!("insert_text. calling input handler");
             with_input_handler(this, |input_handler| {
                 input_handler.replace_text_in_range(replacement_range, text)
             });
-            window_state.lock().ime_state = ImeState::Acted;
+            if is_handling_keydown {
+                window_state.lock().ime_input = Some(ImeInput::Inserted);
+            }
         } else {
-            let mut window_state = window_state.lock();
-            window_state.ime_state = ImeState::Continue;
-            window_state.ime_replacement_range = replacement_range;
+            println!("insert_text. setting ime_state to Continue");
+            window_state.lock().ime_input = Some(ImeInput::Pending {
+                text: text.to_string(),
+                range: replacement_range,
+            });
         }
     }
 }
@@ -1651,8 +1688,11 @@ extern "C" fn set_marked_text(
             .to_str()
             .unwrap();
 
-        window_state.lock().ime_state = ImeState::Acted;
-        window_state.lock().ime_text = Some(text.to_string());
+        println!("set_marked_text. text: {text:?}, selected_range: {selected_range:?}, replacement_range: {replacement_range:?}");
+
+        if let Some(ime_input) = window_state.lock().ime_input.as_mut() {
+            *ime_input = ImeInput::Inserted;
+        }
 
         with_input_handler(this, |input_handler| {
             input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range);
@@ -1661,11 +1701,13 @@ extern "C" fn set_marked_text(
 }
 
 extern "C" fn unmark_text(this: &Object, _: Sel) {
+    println!("unmark text");
     unsafe {
-        let state = get_window_state(this);
-        let mut borrow = state.lock();
-        borrow.ime_state = ImeState::Acted;
-        borrow.ime_text.take();
+        let window_state = get_window_state(this);
+        let mut lock = window_state.lock();
+        if let Some(ime_input) = lock.ime_input.as_mut() {
+            *ime_input = ImeInput::None;
+        }
     }
 
     with_input_handler(this, |input_handler| input_handler.unmark_text());
@@ -1695,11 +1737,13 @@ extern "C" fn attributed_substring_for_proposed_range(
 }
 
 extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
+    println!("do_command_by_selector");
     unsafe {
-        let state = get_window_state(this);
-        let mut borrow = state.lock();
-        borrow.ime_state = ImeState::Continue;
-        borrow.ime_text.take();
+        let window_state = get_window_state(this);
+        let mut lock = window_state.lock();
+        if let Some(ime_input) = lock.ime_input.as_mut() {
+            *ime_input = ImeInput::None;
+        }
     }
 }
 
